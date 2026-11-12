@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
     "scale": 3,
     # 1文字ごとの入力間隔（秒）
     "key_interval": 0.01,
+    # キーを押している時間（秒）。短すぎるとブラウザが取りこぼすことがある
+    "key_hold": 0.01,
     # 画面を読み取る間隔（秒）
     "poll_interval": 0.05,
     # 同じ文字列を連続で読んだとき、再入力するまでの待ち時間（秒）
@@ -170,6 +172,86 @@ def read_romaji(sct, cfg: dict, debug: bool = False) -> str:
     return VALID_RE.sub("", text.strip().lower())
 
 
+# ---------------------------------------------------------------- キー送信
+
+class WindowsKeySender:
+    """SendInput で「本物のキー」（仮想キーコード + スキャンコード）を送る。
+
+    pynput は文字を Unicode 入力 (VK_PACKET) として送るため、メモ帳などには
+    入っても、ブラウザのゲーム（寿司打）では keydown のキーコードが取れず無視される。
+    """
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.user32 = user32
+
+        ULONG_PTR = ctypes.c_size_t
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ULONG_PTR)]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        self.KEYBDINPUT, self.INPUT = KEYBDINPUT, INPUT
+        user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        user32.VkKeyScanW.argtypes = (wintypes.WCHAR,)
+        user32.VkKeyScanW.restype = ctypes.c_short
+        user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+
+    def _send(self, vk: int, up: bool) -> None:
+        KEYEVENTF_KEYUP = 0x0002
+        scan = self.user32.MapVirtualKeyW(vk, 0)  # MAPVK_VK_TO_VSC
+        inp = self.INPUT(type=1, ki=self.KEYBDINPUT(
+            wVk=vk, wScan=scan, dwFlags=KEYEVENTF_KEYUP if up else 0, time=0, dwExtraInfo=0))
+        self.user32.SendInput(1, self.ctypes.byref(inp), self.ctypes.sizeof(inp))
+
+    def tap(self, ch: str, hold: float) -> None:
+        res = self.user32.VkKeyScanW(ch)
+        if res == -1:
+            return
+        vk, shift = res & 0xFF, bool(res & 0x100)
+        VK_SHIFT = 0x10
+        if shift:
+            self._send(VK_SHIFT, False)
+        self._send(vk, False)
+        time.sleep(hold)
+        self._send(vk, True)
+        if shift:
+            self._send(VK_SHIFT, True)
+
+
+class PynputKeySender:
+    def __init__(self):
+        self.kb = keyboard.Controller()
+
+    def tap(self, ch: str, hold: float) -> None:
+        self.kb.press(ch)
+        time.sleep(hold)
+        self.kb.release(ch)
+
+
+def make_sender():
+    if sys.platform == "win32":
+        return WindowsKeySender()
+    return PynputKeySender()
+
+
 # ---------------------------------------------------------------- 本体
 
 class AutoTyper:
@@ -177,14 +259,13 @@ class AutoTyper:
         self.cfg = cfg
         self.running = False
         self.quit = threading.Event()
-        self.kb = keyboard.Controller()
+        self.sender = make_sender()
 
     def type_text(self, text: str) -> None:
         for ch in text:
             if not self.running or self.quit.is_set():
                 return
-            self.kb.press(ch)
-            self.kb.release(ch)
+            self.sender.tap(ch, self.cfg["key_hold"])
             time.sleep(self.cfg["key_interval"])
 
     def on_key(self, key):
@@ -227,10 +308,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="寿司打 自動入力ツール")
     parser.add_argument("--calibrate", action="store_true", help="読み取り範囲を指定する")
     parser.add_argument("--test", action="store_true", help="1回だけ読み取って表示（画像も保存）")
+    parser.add_argument("--typetest", action="store_true",
+                        help="5秒後に 'sushida' と入力する（キー入力が届くかの確認用）")
     args = parser.parse_args()
 
     enable_dpi_awareness()
     cfg = load_config()
+
+    if args.typetest:
+        sender = make_sender()
+        print("5秒以内に入力先（寿司打やブラウザの検索欄）をクリックしてください…")
+        for i in range(5, 0, -1):
+            print(f"  {i}")
+            time.sleep(1)
+        for ch in "sushida":
+            sender.tap(ch, cfg["key_hold"])
+            time.sleep(0.05)
+        print("'sushida' を送信しました。")
+        return
 
     if args.calibrate or not cfg.get("region"):
         calibrate(cfg)
